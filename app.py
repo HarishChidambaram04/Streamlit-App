@@ -1,363 +1,488 @@
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form,Request,Response
-from fastapi.responses import StreamingResponse
-from fastapi.responses import JSONResponse
-import cv2
-import pytesseract
-import re
 import os
-import pandas as pd
-import datetime
-from datetime import datetime, timedelta
-import tempfile
-import subprocess
-from pydantic import BaseModel
-from pathlib import Path
-import requests
-from bs4 import BeautifulSoup
-from io import StringIO
+import time
 import csv
+import re
+import requests
+import tempfile
+import pandas as pd
+import streamlit as st
+import firebase_admin
+from firebase_admin import credentials, auth
+from bs4 import BeautifulSoup
+from st_aggrid import AgGrid, GridOptionsBuilder
 
-app = FastAPI()
-
-# Setup Tesseract OCR path
-pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-
-
-
-UPLOAD_DIR = tempfile.gettempdir()
-time_storage={}
+# Initialize Firebase only once
+if not firebase_admin._apps:
+    cred = credentials.Certificate('login-page-e886b-0aac38c36d9f.json')
+    firebase_admin.initialize_app(cred)
 
 
-DOCUMENTS_DIR = Path.home() / "Documents/TrimmedVideos"
-DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)  # Ensure the folder exists
+FASTAPI_URL = "http://127.0.0.1:8000"
 
+FIREBASE_WEB_API_KEY = "AIzaSyCct_-zXK4ZSknaGENqGbDfrC1RpFuXkvM"
+
+# Session state for user authentication
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if "video_uploaded" not in st.session_state:
+    st.session_state["video_uploaded"] = False
+video_placeholder = st.empty()
+if "uploaded_video_path" in st.session_state:
+    video_placeholder.video(st.session_state["uploaded_video_path"])
 
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
-def is_valid_video_file(filename: str) -> bool:
-    """Check if the uploaded file is a valid video format."""
-    return any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
+# Custom CSS Styling
+st.markdown("""
+    <style>
+        /* Main container styling */
+        .main {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            height: 100vh;
+        }
+        
+        /* Auth container styling */
+        # .auth-container {
+           
+        #     padding: 2rem;
+        #     border-radius: 20px;
+        #     box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        #     margin: 2rem auto;
+        #     max-width: 500px;
+        # }
 
-# Extract timestamp from video frame (customizable region)
-def extract_timestamp(frame, x=0, y=0, w=950, h=60):
-    try:
-        timestamp_crop = frame[y:y+h, x:x+w]
-        timestamp_grey = cv2.cvtColor(timestamp_crop, cv2.COLOR_BGR2GRAY)
-        _, timestamp_thresh = cv2.threshold(timestamp_grey, 127, 255, cv2.THRESH_BINARY)
-        candidate_str = pytesseract.image_to_string(timestamp_thresh, config='--psm 6')
-        regex_str = r'(?i)Date:\s*(\d{4}-\d{2}-\d{2})\s*Time:\s*(\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM))'
-        match = re.search(regex_str, candidate_str)
-        if match:
-            return match.groups()
-    except Exception as e:
-        return None, None
-    return None, None
-
-# Get timestamp from a specific video frame
-def get_video_timestamp(video_path, frame_position):
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_position)
-    ret, frame = cap.read()
-    cap.release()
-    if ret:
-        return extract_timestamp(frame)
-    return None, None
-
-# Extract the initial timestamp from the video
-def get_initial_time(video_path):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return "00:00:00 AM"
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    for i in range(0, min(100, frame_count)):
-        _, time_str = get_video_timestamp(video_path, i)
-        if time_str:
-            cap.release()
-            return time_str
-    cap.release()
-    return "00:00:00 AM"
-
-# Extract the final timestamp from the video
-def get_video_end_time(video_path):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return "00:00:00 AM"
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    for i in range(frame_count - 1, max(0, frame_count - 100) - 1, -1):
-        _, time_str = get_video_timestamp(video_path, i)
-        if time_str:
-            cap.release()
-            return time_str
-    cap.release()
-    return "00:00:00 AM"
-
-# Convert time string to seconds for easier manipulation
-def time_to_seconds(time_str):
-    try:
-        time_obj = datetime.strptime(time_str, '%I:%M:%S %p')
-        return time_obj.hour * 3600 + time_obj.minute * 60 + time_obj.second
-    except ValueError:
-        return 0
-
-
-
-
-def parse_data(raw_text):
-    field_patterns = {
-        "Registration Number": r"REGISTRATION NUMBER\s*:\s*(\d+)",
-        "Full Name": r"FULL NAME\s*:\s*([A-Za-z\s]+)",
-        "Mobile": r"MOBILE\s*:\s*(\d{10})",
-        "Company": r"COMPANY\s*:\s*([\w\s&.,-]+)",
-        "Designation": r"DESIGNATION\s*:\s*([\w\s&.,-]+)",
-        "Address": r"ADDRESS\s*:\s*([\w\s&.,-]+)",
-        "City": r"CITY\s*:\s*([\w\s]+)",
-        "State": r"STATE\s*:\s*([\w\s]+)",
-        "Pincode": r"PINCODE\s*:\s*(\d{6})",
-        "Email": r"EMAIL\s*:\s*([\w.\-]+@[\w.\-]+\.\w+)",
-    }
-    parsed_data = {}
-    for field, pattern in field_patterns.items():
-        match = re.search(pattern, raw_text, re.IGNORECASE)
-        value = match.group(1).strip() if match else ""
-        value = re.sub(r'\b(MOBILE|DESIGNATION|ADDRESS|CITY|STATE|PINCODE)\b', '', value, flags=re.IGNORECASE).strip()
-        parsed_data[field] = value
-    return parsed_data if parsed_data.get("Registration Number") else None
-
-def process_urls(excel_data):
-    fieldnames = ["Registration Number", "Full Name", "Mobile", "Company", "Designation",
-                  "Address", "City", "State", "Pincode", "Email", "Date", "Time"]
-    seen_entries = set()
-    output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-
-    for _, row in excel_data.iterrows():
-        url, date, time = row["Data"], row.get("Date", ""), row.get("Time", "")
-        if not url.startswith("https://www.smartexpos.in/vr/pass/"):
-            continue  # Skip invalid URLs
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": "https://www.smartexpos.in/",
-            "Connection": "keep-alive"
+        .auth-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            margin-top: -20px;  /* Adjust this value if needed */
         }
 
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-        except requests.RequestException:
-            continue  # Skip network errors
-
-        soup = BeautifulSoup(response.content, "html.parser")
-        table = soup.find('table')
-        if not table:
-            continue  # Skip if no data found
-
-        raw_text = table.get_text(" ", strip=True)
-        parsed_data = parse_data(raw_text)
-        if not parsed_data:
-            continue  # Skip if parsing fails
-
-        entry_id = f"{parsed_data['Registration Number']}|{parsed_data['Full Name']}"
-        if entry_id not in seen_entries:
-            seen_entries.add(entry_id)
-            parsed_data.update({"Date": date, "Time": time})
-            writer.writerow(parsed_data)
-
-    output.seek(0)
-    return output
-
-@app.post("/process/")
-async def process_file(file: UploadFile = File(...)):
-    file_extension = file.filename.split('.')[-1].lower()
-    if file_extension not in ["csv", "xlsx"]:
-        raise HTTPException(status_code=400, detail="Invalid file format")
-
-    try:
-        file.file.seek(0)  # Ensure file pointer is at the beginning
-        df = pd.read_csv(file.file) if file_extension == "csv" else pd.read_excel(file.file, engine='openpyxl')
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
-
-    if "Data" not in df.columns:
-        raise HTTPException(status_code=400, detail="Column 'Data' not found in file")
-
-    output_csv = process_urls(df)
-
-    return StreamingResponse(output_csv, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=processed_data.csv"})
-
-
-@app.post("/upload_video/")
-def upload_video(file: UploadFile = File(...)):
-    try:
-        temp_dir = tempfile.gettempdir()
-        file_path = os.path.join(temp_dir, file.filename)
-        with open(file_path, "wb") as buffer:
-            buffer.write(file.file.read())
         
-        initial_time = get_initial_time(file_path)
-        end_time = get_video_end_time(file_path)
+        /* Input field styling */
+        .stTextInput>div>div>input {
+            border-radius: 10px;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+        }
         
-        return JSONResponse(content={"file_path": file_path, "initial_time": initial_time, "end_time": end_time})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/upload_csv/")
-async def upload_csv(file: UploadFile):
-    csv_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(csv_path, "wb") as f:
-        f.write(file.file.read())
-    df = pd.read_csv(csv_path, dtype=str)
-    return JSONResponse({"file_path": csv_path, "columns": list(df.columns)})
-
-
-
-@app.post("/filter_csv/")
-async def filter_csv(file_path: str = Form(...), column: str = Form(...), value: str = Form(...)):
-    df = pd.read_csv(file_path, dtype=str)
-    filtered_df = df[df[column] == value]
-    return JSONResponse({"filtered_data": filtered_df.to_dict(orient="records")})
-
-
-
-
-@app.post("/jump_to_time/")
-async def jump_to_time(initial_time: str = Form(...), jump_time: str = Form(...)):
-    """Calculate jump time in seconds."""
-    try:
-        jump_seconds = time_to_seconds(jump_time) - time_to_seconds(initial_time)
-
-        if jump_seconds < 0:
-            return JSONResponse({"error": "Jump time cannot be before initial time"}, status_code=400)
-
-        return JSONResponse({"jump_seconds": jump_seconds})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/trim_video/")
-async def trim_video(
-    file_path: str = Form(...), 
-    start_time: str = Form(...), 
-    end_time: str = Form(...), 
-    initial_time_str: str = Form(...)
-):
-    """Trim video using FFmpeg and return new file path."""
-    video_path = Path(file_path)
-
-    if not video_path.exists():
-        return JSONResponse({"error": "File not found"}, status_code=404)
-
-    initial_time_sec = time_to_seconds(initial_time_str)
-    start_time_sec = time_to_seconds(start_time) - initial_time_sec
-    end_time_sec = time_to_seconds(end_time) - initial_time_sec
-
-    if start_time_sec < 0 or end_time_sec < 0 or start_time_sec >= end_time_sec:
-        return JSONResponse({"error": "Invalid start or end time"}, status_code=400)
-
-    # Define trimmed file save location
-    trimmed_filename = video_path.stem + "_trimmed.mp4"
-    trimmed_file_path = DOCUMENTS_DIR / trimmed_filename
-
-    ffmpeg_command = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",  # Suppress logs for speed
-        "-i", str(video_path),
-        "-ss", str(start_time_sec),
-        "-to", str(end_time_sec),
-        "-c:v", "libx264", "-preset", "ultrafast",  # 🚀 Fastest encoding
-        "-c:a", "aac", "-strict", "experimental",
-        str(trimmed_file_path)
-    ]
-
-    try:
-        subprocess.run(ffmpeg_command, check=True)
-        return JSONResponse({"trimmed_video_path": str(trimmed_file_path)})
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": f"FFmpeg Error: {e}"}, status_code=500)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        /* Button styling */
+        .stButton>button {
+            background: #6366f1;
+            color: white;
+            border-radius: 10px;
+            padding: 12px 24px;
+            border: none;
+            font-weight: 600;
+            width: 100%;
+            transition: all 0.3s;
+        }
+        
+        .stButton>button:hover {
+            background: #4f46e5;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(79,70,229,0.3);
+        }
+        
+        /* Toggle styling */
+        .toggle-container {
+            display: flex;
+            justify-content: center;
+            margin: 1.5rem 0;
+        }
+        
+        .toggle-btn {
+            padding: 0.75rem 2rem;
+            border: none;
+            background: none;
+            font-weight: 600;
+            color: #64748b;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .toggle-btn.active {
+            color: #6366f1;
+            border-bottom: 3px solid #6366f1;
+        }
+        
+        /* Error message styling */
+        .error-message {
+            color: #ef4444;
+            padding: 1rem;
+            border-radius: 10px;
+            background: #fee2e2;
+            margin: 1rem 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+def firebase_login(email, password):
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_WEB_API_KEY}"
+    payload = {"email": email, "password": password, "returnSecureToken": True}
+    response = requests.post(url, json=payload)
+    return response.json() if response.status_code == 200 else None
+
+def firebase_signup(email, password):
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_WEB_API_KEY}"
+    payload = {"email": email, "password": password, "returnSecureToken": True}
+    response = requests.post(url, json=payload)
+    return response.json() if response.status_code == 200 else None
+
+def login_page():
+    """Modern Authentication Page"""
+    # Session state initialization
+    if 'show_login' not in st.session_state:
+        st.session_state.show_login = True
+    
+    # Main container
+    with st.container():
+        st.markdown("<div class='auth-container'>", unsafe_allow_html=True)
+        
+        # Header Section# st.image("xow-letter-logo-design-white-background-creative-circle-concept-254663990-removebg-preview.png",width=300)
+
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            st.image("https://cdn-icons-png.flaticon.com/512/6681/6681204.png", width=80)
+            # st.image("xow-letter-logo-design-white-background-creative-circle-concept-254663990-removebg-preview.png",width=300)
+
+        with col2:
+            st.markdown("<h1 style='margin:0; color:#1e293b;'>Welcome Back! 👋</h1>", unsafe_allow_html=True)
+            st.markdown("<p style='color:#64748b; margin:0;'>Please sign in to continue</p>", unsafe_allow_html=True)
+        
+        # Toggle Buttons
+        st.markdown("<div class='toggle-container'>", unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Login", key="login_toggle") or st.session_state.show_login:
+                st.session_state.show_login = True
+        with col2:
+            if st.button("Sign Up", key="signup_toggle"):
+                st.session_state.show_login = False
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Form Section
+        if st.session_state.show_login:
+            with st.form(key="login_form"):
+                email = st.text_input("📧 Email Address", placeholder="Enter your email")
+                password = st.text_input("🔑 Password", type="password", placeholder="••••••••")
+                
+                # Remember me checkbox
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    remember_me = st.checkbox("Remember me")
+                with col2:
+                    st.markdown("<div style='text-align:right; padding-top:0.5rem;'>"
+                                "[Forgot Password?](#)</div>", unsafe_allow_html=True)
+                
+                if st.form_submit_button("Sign In →"):
+                    # Firebase login logic
+                    user_data = firebase_login(email, password)
+                    if user_data and "idToken" in user_data:
+                        st.session_state.authenticated = True
+                        st.success("Login Successful!")
+                        st.rerun()
+                    else:
+                        st.markdown("<div class='error-message'>❌ Invalid credentials. Please try again.</div>", 
+                                    unsafe_allow_html=True)
+        else:
+            with st.form(key="signup_form"):
+                email = st.text_input("📧 Work Email", placeholder="name@company.com")
+                password = st.text_input("🔑 Create Password", type="password", 
+                                        placeholder="At least 8 characters")
+                confirm_password = st.text_input("🔒 Confirm Password", type="password", 
+                                               placeholder="Re-enter your password")
+                
+                if st.form_submit_button("Create Account →"):
+                    if password != confirm_password:
+                        st.markdown("<div class='error-message'>❌ Passwords do not match.</div>", 
+                                    unsafe_allow_html=True)
+                    else:
+                        user_data = firebase_signup(email, password)
+                        if user_data and "idToken" in user_data:
+                            st.success("🎉 Account created successfully! Please login.")
+                            st.session_state.show_login = True
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.markdown("<div class='error-message'>❌ Error creating account. Try different email.</div>", 
+                                       unsafe_allow_html=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)  # Close auth-container
+        
+
+
+
+def video_upload_page():
+    def logout():
+        for key in ["authenticated", "uploaded_video_path", "initial_time", "end_time", "video_uploaded"]:
+            if key in st.session_state:
+                del st.session_state[key] 
+        
+        st.rerun()  # Force UI refresh
+
+    # Add logout button
+    if st.sidebar.button("🚪 Logout"):
+        logout()
+
+    def is_valid_video_file(filename: str) -> bool:
+        return any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
+
+    st.sidebar.header("📂 Upload Video File")
+    uploaded_file = st.sidebar.file_uploader("Upload a video", type=["mp4", "avi", "mov"], label_visibility="collapsed")
+    if uploaded_file is None:
+        st.session_state.pop("uploaded_video_path", None)
+        st.session_state.pop("initial_time", None)
+        st.session_state.pop("end_time", None)
+        st.session_state.pop("video_uploaded", None)
+        video_placeholder.empty()  
+
+    if uploaded_file is not None:
+        if not is_valid_video_file(uploaded_file.name):
+            st.error("🚨 Please upload a valid video file!")
+        else:
+            temp_file_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
+            with open(temp_file_path, "wb") as temp_file:
+                temp_file.write(uploaded_file.read())
+
+            try:
+                with open(temp_file_path, "rb") as f:
+                    response = requests.post(f"{FASTAPI_URL}/upload_video/", files={"file": f}, timeout=30)
+                
+                if response.status_code == 200:
+                    data = response.json()
+
+                    if "initial_time" not in data or "end_time" not in data:
+                        st.error("🚨 Initial and end time not extracted!")
+                    elif data["initial_time"] >= data["end_time"]:
+                        st.error("🚨 Invalid timestamps: Initial time cannot be greater than or equal to end time!")
+                    else:
+                        st.session_state["uploaded_video_path"] = data["file_path"]
+                        st.session_state["initial_time"] = data["initial_time"]
+                        st.session_state["end_time"] = data["end_time"]
+                        st.session_state["video_uploaded"] = True
+
+                        # Display video
+                        video_placeholder.video(st.session_state["uploaded_video_path"])
+
+                        col1, col2 = st.columns([1, 1])
+                        with col1:
+                            st.markdown(f"**Initial Time:** {data['initial_time']}")
+                        with col2:
+                            st.markdown(f"<p style='text-align: right;'><b>End Time:</b> {data['end_time']}</p>", unsafe_allow_html=True)
+                else:
+                    st.error("🚨 Error uploading video!")
+            except requests.exceptions.Timeout:
+                st.error("🚨 Server is not responding. Please try again later.")
+            except Exception as e:
+                st.error(f"🚨 An unexpected error occurred: {str(e)}")
+
+
+
+    st.sidebar.header("📄 Upload CSV / Data Crawling File")
+    uploaded_file = st.sidebar.file_uploader("Upload your file", type=["csv", "xls", "xlsx"], label_visibility="collapsed")
+    def parse_data(raw_text):
+        field_patterns = {
+            "Registration Number": r"REGISTRATION NUMBER\s*:\s*(\d+)",
+            "Full Name": r"FULL NAME\s*:\s*([A-Za-z\s]+)",
+            "Mobile": r"MOBILE\s*:\s*(\d{10})",
+            "Company": r"COMPANY\s*:\s*([\w\s&.,-]+)",
+            "Designation": r"DESIGNATION\s*:\s*([\w\s&.,-]+)",
+            "Address": r"ADDRESS\s*:\s*([\w\s&.,-]+)",
+            "City": r"CITY\s*:\s*([\w\s]+)",
+            "State": r"STATE\s*:\s*([\w\s]+)",
+            "Pincode": r"PINCODE\s*:\s*(\d{6})",
+            "Email": r"EMAIL\s*:\s*([\w.\-]+@[\w.\-]+\.\w+)",
+        }
+        parsed_data = {}
+        for field, pattern in field_patterns.items():
+            match = re.search(pattern, raw_text, re.IGNORECASE)
+            value = match.group(1).strip() if match else ""
+            value = re.sub(r'\b(MOBILE|DESIGNATION|ADDRESS|CITY|STATE|PINCODE)\b', '', value, flags=re.IGNORECASE).strip()
+            parsed_data[field] = value
+        return parsed_data if parsed_data.get("Registration Number") else None
+
+    def process_urls(excel_data, output_file_path):
+        fieldnames = ["Registration Number", "Full Name", "Mobile", "Company", "Designation",
+                    "Address", "City", "State", "Pincode", "Email", "Date", "Time"]
+        seen_entries = set()
+        with open(output_file_path, mode="w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            for _, row in excel_data.iterrows():
+                url, date, time = row["Data"], row.get("Date", ""), row.get("Time", "")
+                if not url.startswith("https://www.smartexpos.in/vr/pass/"):
+                    st.warning(f"Skipping invalid URL: {url}")
+                    continue
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Referer": "https://www.smartexpos.in/",
+                    "Connection": "keep-alive"
+                }
+
+                try:
+                    response = requests.get(url, headers=headers, timeout=15)
+                    response.raise_for_status()
+                except requests.RequestException as e:
+                    st.error(f"Network error: {e}")
+                    continue
+                soup = BeautifulSoup(response.content, "html.parser")
+                table = soup.find('table')
+                if not table:
+                    st.error("Error: No table found.")
+                    continue
+                raw_text = table.get_text(" ", strip=True)
+                parsed_data = parse_data(raw_text)
+                if not parsed_data:
+                    st.error("Error: Data parsing failed.")
+                    continue
+                entry_id = f"{parsed_data['Registration Number']}|{parsed_data['Full Name']}"
+                if entry_id not in seen_entries:
+                    seen_entries.add(entry_id)
+                    parsed_data.update({"Date": date, "Time": time})
+                    writer.writerow(parsed_data)
+        st.success(f"Data saved to {output_file_path}")
+        return pd.read_csv(output_file_path)
+    if uploaded_file:
+        file_extension = uploaded_file.name.split('.')[-1].lower()
+
+        # Show spinner based on file type
+        with st.spinner("🌐 Crawling data from file... Please wait!" if file_extension == "csv" else "📂 Processing CSV file..."):
+            # Read CSV or Excel
+            df = pd.read_csv(uploaded_file) if file_extension == "csv" else pd.read_excel(uploaded_file, engine='openpyxl')
+
+            output_path = os.path.join(os.getcwd(), "processed_data.csv")
+
+            # Process only if "Data" column exists
+            if "Data" in df.columns:
+                df = process_urls(df, output_path)
+
+            # Store in session state
+            st.session_state["csv_data"] = df
+    else:
+        # Clear session state when file is removed
+        st.session_state.pop("csv_data", None)
+        st.session_state.pop("filtered_data", None)
+
+    if "csv_data" in st.session_state:
+        column_name = st.sidebar.selectbox("🔽 Select Column", st.session_state["csv_data"].columns)
+        if column_name:
+            unique_values = st.session_state["csv_data"][column_name].dropna().unique()
+            selected_value = st.sidebar.selectbox("🎯 Select Value", unique_values)
+            if selected_value and st.sidebar.button("🔍 Filter Data"):
+                st.session_state["filtered_data"] = st.session_state["csv_data"][st.session_state["csv_data"][column_name] == selected_value]
+                try:
+                    response = requests.post(
+                        f"{FASTAPI_URL}/filter_csv/",
+                        data={"file_path": st.session_state["csv_data"], "column": column_name, "value": selected_value}
+                    )
+                    if response.status_code == 200:
+                        st.session_state["filtered_data"] = response.json()["filtered_data"]
+                        st.session_state["selected_column"] = column_name
+                except Exception as e:
+                    st.sidebar.error(f"⚠️ Error during filtering: {e}")
+
+
+
+            if "filtered_data" in st.session_state:
+                df_filtered = pd.DataFrame(st.session_state["filtered_data"])
+
+                # Convert all column names to lowercase for consistency
+                df_filtered.columns = df_filtered.columns.str.lower()
+
+                st.write("### 📊 Filtered Data")
+
+                # Set up Ag-Grid Table
+                gb = GridOptionsBuilder.from_dataframe(df_filtered)
+                gb.configure_selection("single", use_checkbox=True)
+                grid_options = gb.build()
+
+                selected_rows = AgGrid(df_filtered, gridOptions=grid_options, height=300)["selected_rows"]
+                
+                if selected_rows is not None and len(selected_rows) > 0:  # ✅ Fix NoneType issue
+                    selected_df = pd.DataFrame(selected_rows)  # Convert selected rows to DataFrame
+                    
+                    if "time" in selected_df.columns:  # ✅ Ensure "time" column exists
+                        selected_time = selected_df.iloc[0]["time"]  # ✅ Access first row's "time" value
+
+                        if selected_time:  # ✅ Ensure "time" is not None or empty
+                            try:
+                                response = requests.post(
+                                    f"{FASTAPI_URL}/jump_to_time/",
+                                    data={"initial_time": st.session_state["initial_time"], "jump_time": selected_time}
+                                )
+
+                                if response.status_code == 200:
+                                    jump_seconds = response.json().get("jump_seconds")
+
+                                    if jump_seconds is not None:  # ✅ Ensure valid response
+                                        st.success(f"⏩ Jumping to Selected Row Value")
+                                        video_placeholder.video(st.session_state["uploaded_video_path"], start_time=int(jump_seconds))
+                                    else:
+                                        st.error("🚨 Invalid jump time received from API.")  # ✅ Edge case for missing response
+                                else:
+                                    st.error("🚨 Error: Selected Value Exceeds")  # ✅ Error message shown when API fails
+                            except Exception as e:
+                                st.error(f"⚠️ Error jumping to time: {e}")  # ✅ Exception handling
+                        else:
+                            st.error("🚨 Selected row does not have a valid 'time' value!")  # ✅ Ensuring valid time
+                    else:
+                        st.error("🚨 'time' column not found in the selected data!")  # ✅ Column missing
+                else:
+                    st.warning("⚠️ No row selected! Please select a row to proceed.")  # ✅ No selection warning
+
+    st.sidebar.header("🎬 Go to Timestamp")
+# 🏃‍♂️ Jump to Time Feature
+    jump_time = st.sidebar.text_input("Enter Jump Time (HH:MM:SS AM/PM)")
+    if st.sidebar.button("Jump to Time"):
+        if "uploaded_video_path" in st.session_state and "initial_time" in st.session_state:
+            data = {
+                "initial_time": st.session_state["initial_time"],
+                "jump_time": jump_time
+            }
+            response = requests.post(f"{FASTAPI_URL}/jump_to_time/", data=data)
+
+            if response.status_code == 200:
+                jump_seconds = response.json()["jump_seconds"]
+                video_placeholder.video(st.session_state["uploaded_video_path"], start_time=int(jump_seconds))
+            else:
+                st.sidebar.error(f"🚨 Error: {response.json().get('error', 'Unknown error')}")
+
+    
+    st.sidebar.subheader("✂️ Trim Video")
+    start_time = st.sidebar.text_input("⏱️ Start Time (HH:MM:SS AM/PM)")
+    end_time = st.sidebar.text_input("⏳ End Time (HH:MM:SS AM/PM)")
+
+    if st.sidebar.button("📥Trim Video"):
+        if not start_time or not end_time:
+            st.sidebar.error("🚨 Please enter both start and end times!")
+        elif "uploaded_video_path" not in st.session_state:
+            st.sidebar.error("🚨 Please upload a video first!")
+        else:
+            trim_data = {
+                "file_path": st.session_state["uploaded_video_path"],
+                "start_time": start_time,
+                "end_time": end_time,
+                "initial_time_str": st.session_state["initial_time"]
+            }
+            with st.spinner("⏳ Trimming video... Please wait!"):
+                response = requests.post(f"{FASTAPI_URL}/trim_video/", data=trim_data)
+
+            if response.status_code == 200:
+                trimmed_video_path = response.json()["trimmed_video_path"]
+                st.sidebar.success(f"✅ Video trimmed successfully!\n📁 Saved at: `{trimmed_video_path}`")
+            else:
+                st.sidebar.error(f"🚨 Error: {response.json().get('error', 'Unknown error')}")
+
+if not st.session_state["authenticated"]:
+    login_page()
+else:
+    video_upload_page()
