@@ -18,7 +18,9 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
 
-FASTAPI_URL = "http://127.0.0.1:8000"
+# FASTAPI_URL = "http://127.0.0.1:8000"
+
+FASTAPI_URL = "https://streamlit-app-backend.onrender.com"
 
 FIREBASE_WEB_API_KEY = "AIzaSyCct_-zXK4ZSknaGENqGbDfrC1RpFuXkvM"
 
