@@ -9,4 +9,4 @@ pydantic
 python-multipart
 firebase-admin
 streamlit
-st-aggrid
+st-aggrid==1.1.0
