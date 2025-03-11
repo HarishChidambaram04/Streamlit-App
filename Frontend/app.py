@@ -14,7 +14,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder
 
 # Initialize Firebase only once
 if not firebase_admin._apps:
-    cred = credentials.Certificate('login-page-e886b-0aac38c36d9f.json')
+    cred = credentials.Certificate('Frontend/login-page-e886b-0aac38c36d9f.json')
     firebase_admin.initialize_app(cred)
 
 
