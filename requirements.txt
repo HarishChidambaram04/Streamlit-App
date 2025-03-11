@@ -8,5 +8,5 @@ beautifulsoup4==4.11.1
 pydantic==1.10.4
 python-multipart==0.0.6
 firebase-admin==6.0.0
-streamlit==1.46.0
+streamlit
 st-aggrid==0.2.3
